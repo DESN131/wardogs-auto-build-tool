@@ -1,0 +1,8 @@
+mss>=9.0
+opencv-python-headless==4.10.0.84
+numpy==1.26.1
+PyYAML>=6.0
+pywin32>=306
+
+# Optional: GPU capture backend (faster, not required)
+# dxcam>=0.0.5

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration overrides
+config.local.yaml
+
+# Runtime logs and generated artifacts
+logs/*
+!logs/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+debug/
+_analysis/
+
+# Local validation screenshots / reference data (not part of git)
+assets/**/*.png
+assets/**/*.jpg
+assets/**/*.jpeg
+assets/**/*.bmp
+assets/**/*.webp
+my_shots/
+my_white_shots/
+screenshots/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

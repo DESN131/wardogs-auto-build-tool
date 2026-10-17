@@ -1,0 +1,143 @@
+# 自动建造脚本配置（2560x1440 实测参数）
+# 先用 --dry-run 看检测，再 --max-builds 1 验证一次完整建造。
+
+game:
+  # 游戏窗口标题子串；所有人的窗口名一致，默认已配置好，无需修改
+  window_title: "WARDOGS"
+  capture_backend: "mss"      # mss | dxcam（dxcam 需要额外安装）
+  monitor_index: 1            # 无窗口/dry-run 时使用的主显示器
+  allow_cold_white: true      # 启动时准星已经在白叉上，也允许点击
+
+detector:
+  # 大画面先 2 倍降采样找候选，再回全分辨率局部确认；
+  # 白色锁定/找不到目标时自动回退到完整 detector。
+  fast_mode: true
+  # assets/reference/1-4.png 的黄叉 H≈29, S≈160-175, V=255；
+  # assets/validate/ 的 WARDOGS 黄叉 H≈24-26, S≈179-255, V≈170-244。
+  # 统一范围覆盖暗光/阴影，H≥22 同时排除 3/4.png 的黄色路沿（H≈20-21）。
+  hsv_low:  [22, 130, 110]
+  hsv_high: [36, 255, 255]
+  # 色度条件：比绝对 RGB 更抗整体亮度/HDR 变化
+  max_b_over_g: 0.55
+  max_rg_over_g: 0.35
+  min_area: 600
+  max_area: 12000
+  min_w: 40                   # 过滤建造后偶发的 35px 宽黄色 UI/小物体
+  max_w: 400
+  min_h: 30
+  max_h: 300
+  fill_min: 0.15
+  fill_max: 0.65
+  aspect_min: 0.45             # validate v6 已到 0.60，给更斜/更窄的角度留余量
+  aspect_max: 3.0             # 4.png 实测 2.15；原方案 2.0 会漏检
+  morph_kernel: 3
+  center_ui_radius: 60       # 忽略准星 60 px 内的窄黄色 UI/残影
+  center_ui_max_size: 60     # 仅当宽度 <60 px 时忽略
+  roi_half: 500               # 瞄准/轮询只检测中心 1000x1000；丢失时回退全屏
+  white:
+    # WARDOGS 白叉实测约 V=192-228、S=16-41；不是纯白 255
+    v_min: 185
+    relaxed_v: 170            # 暗色表面上白叉可能整体变暗
+    relaxed_s_max: 55
+    dv_min: 35                # 中心比周围环亮多少才算白叉
+    s_max: 50
+    min_area: 600            # w3 被武器遮挡后可见面积约 1024 px
+    max_area: 15000
+    min_w: 35
+    max_w: 400
+    min_h: 20
+    max_h: 300
+    fill_min: 0.15           # 排除细准星圆环
+    fill_max: 0.65
+    aspect_min: 0.4
+    aspect_max: 3.5
+    click_radius_px: 120     # 白叉中心离准星 59-64 px 时仍然可建造（留余量）
+
+aim:
+  # 屏幕像素 / 鼠标 counts；负号表示鼠标右移时目标在屏幕上左移。
+  # 首次远距离瞄准会自动做 12 counts 的小探测来校准符号和大小。
+  gain_x: -0.55
+  gain_y: -0.55
+  gain_min: 0.05
+  gain_max: 5.0
+  gain_ema: 0.35
+  alpha_far: 0.88
+  alpha_near: 0.76
+  far_px: 70
+  max_step_counts: 360
+  max_step_px: 520            # 单次修正最多移动这么多屏幕像素，防止高灵敏度过冲
+  min_step_counts: 6
+  white_frames: 1             # 白叉检测已稳定；想更保守可改回 2
+  stable_frames: 1            # 黄叉尺寸/颜色已过滤，首帧即可进入 AIM
+  stable_px: 8
+  settle_ms: [25, 50]
+  max_iterations: 8
+  lost_timeout_s: 2.5        # 仅用于丢失告警日志；不会暂停，持续检测直到 F9
+  calibrate_min_error_px: 150
+  calibrate_probe_counts: 12
+  white_recover_radius_px: 450   # 白叉偏离中心时，先朝白叉候选移动
+  white_recover_max_attempts: 2
+
+click:
+  hold_ms: 510
+  post_release_ms: [5, 12]
+  build_wait_s: 2.0
+  poll_ms: 10
+  max_failed_clicks: 3
+  retry_delay_ms: 250
+  min_move_px: 12              # 点击后新黄叉至少移动这么多像素才算成功
+  ensure_cursor_in_window: true   # 点击前若系统光标已跑出客户区，先移回中心
+  max_builds: 0               # 0 = 不限；命令行 --max-builds 可覆盖
+  max_swings: 0               # 0 = 不限；按真实落锤次数限制，便于 30 锤对比测试
+
+miss:
+  # 每完成 N 次“瞄准建造”后，执行一次不瞄准黄叉的左键点击
+  every_n_builds: 0
+  min_distance_px: 120
+  look_away_max_tries: 2
+  hold_ms: 510
+
+swing:
+  enabled: true
+  # false: 先确认新黄叉再起锤（当前实测更稳定、更快，默认）。
+  # true: 落锤后立即起下一锤，在抡锤期间等待并瞄准新黄叉（用 --chain 复测）。
+  chain: false
+  strike_guard_ms: 60          # 最后 60 ms 不移动，等待落锤
+  max_start_error_px: 420      # 黄叉在此范围内直接起锤，在抡锤时瞄准
+  aim_tolerance_px: 12
+  max_aim_moves: 2
+  chain_min_move_px: 40        # 新黄叉相对预测旧位置的位移超过此值才算建成
+  # 起锤后多少毫秒仍看不到新黄叉就提前松开；提前松开没有落锤、0 进度。
+  # 450 表示不在落锤前松开，未瞄准也完整落锤拿 1/5 进度（30 锤对比用）。
+  chain_probe_ms: 450
+  # 建造成功后旧白叉会在准星处残留短暂时间，而新黄叉已经出现在旁边。
+  # 此时不要把中心白叉当成可建造目标，否则会原地挥锤。
+  stale_lock_min_px: 55        # 距准星超过此距离的黄叉才可能是“下一个目标”
+  stale_lock_hint_px: 180      # 与上次确认的新黄叉位置相差不超过此值
+  stale_lock_max_age_s: 2.0    # 提示有效期
+
+human:
+  pre_move_ms: [10, 35]
+  steps: [14, 20]
+  step_delay_ms: [3, 5]
+  long_pause_prob: 0.03
+  long_pause_ms: [5, 12]
+  bend_ratio: [0.06, 0.16]
+  jitter_counts: 2.8
+  jitter_outlier_prob: 0.08
+  jitter_outlier_counts: 4.5
+  overshoot_ratio: [0.06, 0.10]
+  overshoot_max_counts: 30
+  overshoot_pause_ms: [4, 10]
+  post_move_ms: [8, 20]
+  pre_click_ms: [8, 18]
+  post_click_ms: [5, 12]
+  # 落锤后新黄叉已确认时只保留 0–8 ms 微停顿；
+  # 下面的长停顿默认关闭，避免每 8 次出现 200–350 ms 的空档。
+  between_builds_ms: [5, 15]
+  long_break_every: 0
+  long_break_ms: [120, 200]
+
+hotkeys:
+  start_pause: f8
+  stop: f9
