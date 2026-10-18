@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os
 import random
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import win32gui
@@ -24,6 +28,102 @@ def enable_dpi_awareness() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def is_process_elevated() -> bool:
+    """Return whether this process can inject input into elevated windows."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def is_window_elevated(hwnd: int) -> Optional[bool]:
+    """Best-effort elevation check for the process owning a window."""
+    try:
+        import win32api
+        import win32con
+        import win32process
+        import win32security
+
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        process = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        try:
+            token = win32security.OpenProcessToken(
+                process, win32con.TOKEN_QUERY
+            )
+            try:
+                value = win32security.GetTokenInformation(
+                    token, win32security.TokenElevation
+                )
+                return bool(getattr(value, "TokenIsElevated", value))
+            finally:
+                token.Close()
+        finally:
+            process.Close()
+    except Exception:
+        return None
+
+
+_SHELL32 = ctypes.WinDLL("shell32", use_last_error=True)
+_SHELL32.ShellExecuteW.argtypes = [
+    wintypes.HWND,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    ctypes.c_int,
+]
+_SHELL32.ShellExecuteW.restype = ctypes.c_void_p
+
+
+def build_elevation_command(
+    script: str,
+    argv: list[str],
+    *,
+    python: Optional[str] = None,
+    frozen: bool = False,
+) -> tuple[str, str]:
+    """Build the executable and parameter string for an elevated relaunch."""
+    executable = python or sys.executable
+    if frozen:
+        parameters = subprocess.list2cmdline([str(arg) for arg in argv])
+    else:
+        parameters = subprocess.list2cmdline(
+            [str(Path(script).resolve()), *(str(arg) for arg in argv)]
+        )
+    return executable, parameters
+
+
+def relaunch_elevated(
+    argv: Optional[list[str]] = None,
+    *,
+    script: Optional[str] = None,
+) -> bool:
+    """Ask Windows to relaunch this script with an elevated token.
+
+    Returns True only when the ShellExecuteW request started a new process.
+    A False result includes the user cancelling the UAC prompt, so callers
+    should stop instead of continuing with a medium-integrity token.
+    """
+    if os.name != "nt" or is_process_elevated():
+        return False
+    executable, parameters = build_elevation_command(
+        script or sys.argv[0],
+        list(sys.argv[1:] if argv is None else argv),
+        frozen=bool(getattr(sys, "frozen", False)),
+    )
+    result = _SHELL32.ShellExecuteW(
+        None,
+        "runas",
+        executable,
+        parameters,
+        os.getcwd(),
+        1,  # SW_SHOWNORMAL
+    )
+    return int(result or 0) > 32
 
 
 class _TimerResolution:

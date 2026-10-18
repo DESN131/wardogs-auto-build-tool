@@ -46,7 +46,10 @@ from .win_input import (
     ensure_cursor_in_region,
     find_window,
     is_foreground,
+    is_process_elevated,
+    is_window_elevated,
     list_windows,
+    relaunch_elevated,
     send_left_down,
     send_left_up,
     window_title,
@@ -54,6 +57,15 @@ from .win_input import (
 )
 
 log = logging.getLogger("auto_build")
+
+
+class _FlushFileHandler(logging.FileHandler):
+    """Make every record visible to log tails while the bot is running."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
 
 # mss 10.x emits a runtime DeprecationWarning for mss.mss(); PowerShell treats
 # stderr output from a native command as an error when Tee-Object is used.
@@ -455,6 +467,15 @@ class BuildBot:
     # ------------------------------------------------------------- state code
     def run(self) -> None:
         log.info("F8 开始/暂停，F9 退出。先把准星附近留出可见的黄叉/白叉。")
+        log.info("进程权限：%s（游戏若以管理员运行，脚本也需以管理员运行）",
+                 "管理员" if is_process_elevated() else "普通用户")
+        if self.hwnd is not None:
+            game_elevated = is_window_elevated(self.hwnd)
+            if game_elevated is True and not is_process_elevated():
+                log.warning(
+                    "游戏窗口以管理员运行，但脚本不是；Windows 会阻止鼠标/键盘注入。"
+                    "请用管理员权限重新启动脚本。"
+                )
         while not self.stop:
             if self.hotkeys.pressed("f9"):
                 break
@@ -515,8 +536,8 @@ class BuildBot:
                      if self.stats.swings > 0 else 0.0)
         log.info(
             "统计：瞄准建造 %d 次，非瞄准点击 %d 次，失败 %d 次，"
-            "真实落锤 %d 次（提前松开 %d），建造阶段 %.2f s，"
-            "%.0f ms/件，%.0f ms/锤，总用时 %.1f s",
+            "完整左键 %d 次（提前松开 %d），建造阶段 %.2f s，"
+            "%.0f ms/件，%.0f ms/次，总用时 %.1f s",
             self.stats.aimed_builds, self.stats.non_aim_clicks,
             self.stats.failed_clicks, self.stats.swings,
             self.stats.aborted_swings, phase, per_build, per_swing, elapsed,
@@ -994,6 +1015,14 @@ class BuildBot:
             pre_target = preferred.center
         elif det.best is not None:
             pre_target = det.best.center
+        elif (self._last_yellow is not None
+              and self._last_yellow_time is not None
+              and time.monotonic() - self._last_yellow_time <= 1.5):
+            # A white lock may have hidden the yellow candidate in this
+            # frame.  Use the most recent yellow position as the old target
+            # instead of the screen centre, so the same X cannot be counted
+            # as a "new" build after a failed click.
+            pre_target = self._last_yellow.center
         else:
             pre_target = det.screen_center
         log.info("起锤 %.0f ms，期间继续瞄准（落锤前 %.0f ms 停手）",
@@ -1735,7 +1764,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="只检测/规划，不发送鼠标输入")
     parser.add_argument("--max-builds", type=int, default=None, help="瞄准建造多少件后停止；0=不限")
     parser.add_argument("--max-swings", type=int, default=None,
-                        help="完成多少次真实落锤后停止（提前松开不计）；0=不限")
+                        help="完成多少次完整左键（按住到落锤点）后停止；0=不限")
     parser.add_argument("--no-chain", action="store_true",
                         help="覆盖配置，关闭链式挥锤（先确认新黄叉再起锤）")
     parser.add_argument("--chain", action="store_true",
@@ -1743,14 +1772,82 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--debug", action="store_true",
                         help="连续建造时逐步打印检测/瞄准/白叉/点击/等待/建造耗时")
+    parser.add_argument("--log-file", metavar="PATH",
+                        help="同时把完整日志写入文件（自动提权后仍可保留）")
+    parser.add_argument("--elevation-attempted", action="store_true",
+                        help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
+    # Offline image checks and window listing stay usable without a UAC
+    # prompt.  Live input needs the same integrity level as the game window.
+    needs_elevation = not (
+        args.test_images or args.test_dir or args.list_windows or args.dry_run
+    )
+    will_elevate = (
+        sys.platform == "win32"
+        and needs_elevation
+        and not args.elevation_attempted
+        and not is_process_elevated()
+    )
+
+    log_level = logging.DEBUG if (args.verbose or args.debug) else logging.INFO
+    log_formatter = logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
     logging.basicConfig(
-        level=logging.DEBUG if (args.verbose or args.debug) else logging.INFO,
+        level=log_level,
         format="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
+
+    # The elevated child opens the file itself.  Opening it here as well would
+    # truncate the same path twice and interleave the bootstrap messages.
+    if args.log_file and not will_elevate:
+        try:
+            log_path = Path(args.log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = _FlushFileHandler(
+                log_path, mode="w", encoding="utf-8"
+            )
+            file_handler.setFormatter(log_formatter)
+            logging.getLogger().addHandler(file_handler)
+        except OSError:
+            log.exception("无法创建日志文件: %s", args.log_file)
+            return 1
+
+    # Elevation is a process-token property inherited from the parent, so
+    # launching via start.bat from Explorer does not gain it automatically.
+    if (sys.platform == "win32" and needs_elevation
+            and not is_process_elevated()):
+        if args.elevation_attempted:
+            log.error("未能获得管理员权限，已停止。"
+                      "请允许 UAC 提权，或右键 start.bat 选择“以管理员身份运行”。")
+            return 1
+        if not args.log_file:
+            try:
+                redirected = not sys.stdout.isatty()
+            except Exception:
+                redirected = True
+            if redirected:
+                log.warning(
+                    "输出已重定向；自动提权会打开新控制台，原管道不会继承。"
+                    "请加 --log-file 保存完整日志。"
+                )
+        log.info("当前不是管理员，正在请求管理员权限（UAC）...")
+        elevated_args = list(sys.argv[1:] if argv is None else argv)
+        if "--elevation-attempted" not in elevated_args:
+            elevated_args.append("--elevation-attempted")
+        # Always relaunch through the root shim, including when this module
+        # was started with ``python -m wardogs.auto_build``.
+        root_entry = Path(__file__).resolve().parents[1] / "auto_build.py"
+        if relaunch_elevated(elevated_args, script=str(root_entry)):
+            log.info("已启动管理员进程，当前窗口即将退出。")
+            return 0
+        log.error("提权请求被取消或失败，已停止。"
+                  "请允许 UAC 提权，或右键 start.bat 选择“以管理员身份运行”。")
+        return 1
 
     if args.test_click is not None:
         return run_click_test(args.test_click)
@@ -1852,7 +1949,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("运行模式：连续建造，按 F8 暂停/恢复，按 F9 停止")
     max_swings = int(cfg_get(config, "click.max_swings", 0))
     if max_swings > 0:
-        log.info("测试限制：完成 %d 次真实落锤后停止（提前松开不计）", max_swings)
+        log.info("测试限制：完成 %d 次完整左键后停止（提前松开不计）", max_swings)
     bot = BuildBot(
         config, detector, capture, mover, Hotkeys(),
         hwnd=hwnd, fixed_region=fixed_region, dry_run=args.dry_run,

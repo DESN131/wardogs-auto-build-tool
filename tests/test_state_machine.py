@@ -325,6 +325,35 @@ class StateMachineTest(unittest.TestCase):
         self.assertEqual(bot.stats.aimed_builds, 0)
         self.assertEqual(bot.stats.failed_clicks, 1)
 
+    def test_white_lock_does_not_recount_last_yellow(self):
+        config = {
+            "aim": {"settle_ms": [0, 0]},
+            "click": {
+                "hold_ms": 510, "post_release_ms": [0, 0],
+                "build_wait_s": 0.02, "poll_ms": 0,
+                "ensure_cursor_in_window": False, "retry_delay_ms": 0,
+            },
+            "miss": {"every_n_builds": 0},
+            "swing": {"enabled": False},
+            "game": {},
+        }
+        bot = BuildBot(
+            config, None, None, FakeMover(), FakeKeys(),
+            hwnd=None, fixed_region=(0, 0, 2560, 1440),
+            dry_run=False, max_builds=0, debug_dir=None,
+        )
+        bot._sleep = lambda ms: None
+        last_yellow = marker(1151, 729)
+        bot._last_yellow = last_yellow
+        bot._last_yellow_time = time.monotonic()
+        bot._last_det = detection(locked=True)
+        bot._last_det_time = time.monotonic()
+        bot._detect = lambda **_kwargs: detection(last_yellow)
+        bot.mode = "CLICK"
+        bot._step()
+        self.assertEqual(bot.stats.aimed_builds, 0)
+        self.assertEqual(bot.stats.failed_clicks, 1)
+
     def test_click_reuses_verified_frame_without_recapture(self):
         config = {
             "aim": {"settle_ms": [0, 0]},

@@ -88,7 +88,7 @@ click:
   min_move_px: 12              # 点击后新黄叉至少移动这么多像素才算成功
   ensure_cursor_in_window: true   # 点击前若系统光标已跑出客户区，先移回中心
   max_builds: 0               # 0 = 不限；命令行 --max-builds 可覆盖
-  max_swings: 0               # 0 = 不限；按真实落锤次数限制，便于 30 锤对比测试
+  max_swings: 0               # 0 = 不限；按完整左键次数限制，便于 30 次对比测试
 
 miss:
   # 每完成 N 次“瞄准建造”后，执行一次不瞄准黄叉的左键点击

@@ -128,6 +128,17 @@ class DetectorTest(unittest.TestCase):
         self.assertIsNotNone(det.best)
         self.assertTrue(det.locked)
 
+    def test_fast_white_wall_is_not_locked(self):
+        fast = MarkerDetector(DetectorConfig.from_dict({"fast_mode": True}))
+        frame = np.full((1440, 2560, 3), 120, dtype=np.uint8)
+        cv2.rectangle(frame, (900, 400), (1660, 1040), (245, 245, 245), -1)
+        yellow = (0, 255, 255)
+        cv2.line(frame, (1000, 600), (1150, 750), yellow, 20)
+        cv2.line(frame, (1150, 600), (1000, 750), yellow, 20)
+        det = fast.detect(frame)
+        self.assertFalse(det.locked)
+        self.assertIsNotNone(det.best)
+
     def test_validate_white_wardogs_views(self):
         self.require_assets()
         files = sorted((ROOT / "assets" / "validate" / "white").glob("*.png"))

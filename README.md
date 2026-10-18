@@ -1,24 +1,36 @@
 # WARDOGS 自动建造工具
 
-项目代号：`wardogs-auto-build`
-
 面向 Windows + 无边框窗口的 WARDOGS 自动建造工具：识别黄色建造叉，移动准星，按住左键起锤，并在抡锤期间继续瞄准。默认使用“确认新黄叉后再起锤”的稳定模式，也可以通过 `--chain` 启用链式挥锤。
 
 > 自动输入可能违反游戏服务条款。请先在离线/私人环境验证，不要直接用于正式账号。本项目不修改游戏文件、不读取游戏内存、不绕过反作弊。
 
 ## 快速开始
 
-### 首次安装
+### 直接运行（推荐）
+
+双击 `start.bat`，或在项目根目录执行：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+.\start.bat
 ```
 
-### 直接运行
+启动时会自动弹出 UAC 提权请求；允许后会打开一个新的管理员控制台继续运行，原窗口退出。新控制台会短暂取得焦点，切回游戏窗口即可，脚本会等待前台窗口再输入。游戏窗口如果也是管理员权限，Windows 才会把 `SendInput` 的鼠标/键盘事件转发给它。离线截图检测（`--test-images` / `--test-dir`）、`--dry-run` 和 `--list-windows` 不会触发 UAC。
+
+首次运行会自动创建 `.venv` 并安装 `requirements.txt` 中的依赖。启动脚本支持：
 
 ```powershell
+.\start.bat -DryRun
+.\start.bat -DebugMode -MaxBuilds 10
+.\start.bat -Chain -MaxSwings 30
+.\start.bat -Help
+```
+
+`start.bat` 只对本次进程使用 `-ExecutionPolicy Bypass`，不会修改系统执行策略；如果直接运行 `start.ps1` 被策略拦截，可使用 `powershell -ExecutionPolicy Bypass -File .\start.ps1`。
+
+也可以手动启动：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 .\.venv\Scripts\python.exe auto_build.py
 ```
 
@@ -40,9 +52,8 @@ python -m pip install -r requirements.txt
 # 只建一次，确认完整流程
 .\.venv\Scripts\python.exe auto_build.py --max-builds 1
 
-# 带逐步计时日志运行
-.\.venv\Scripts\python.exe auto_build.py --debug 2>&1 |
-  Tee-Object -FilePath logs/debug_run.log
+# 带逐步计时日志运行（自动提权后仍保留完整日志）
+.\.venv\Scripts\python.exe auto_build.py --debug --log-file logs\debug_run.log
 
 # 链式挥锤实验模式
 .\.venv\Scripts\python.exe auto_build.py --chain
@@ -55,13 +66,15 @@ python -m pip install -r requirements.txt
 - 拟人化鼠标移动：弯曲路径、随机抖动、短延迟和末端过冲修正。
 - 510 ms 起锤，前约 450 ms 继续瞄准，最后 60 ms 停止移动。
 - 白叉锁定、新黄叉验证、陈旧白叉过滤。
-- 支持连续建造、按建造数/真实落锤数停止、离线截图验证。
+- 支持连续建造、按建造数/完整左键数停止、离线截图验证。
 
 ## 项目结构
 
 ```text
 wardogs-auto-build/
 ├─ auto_build.py            # 启动入口
+├─ start.bat                # Windows 双击/命令行启动
+├─ start.ps1                # PowerShell 启动与环境检查
 ├─ wardogs/
 │  ├─ auto_build.py         # 主循环、状态机、CLI、日志
 │  ├─ detector.py           # 黄色/白色建造叉检测
@@ -102,11 +115,11 @@ wardogs-auto-build/
 # 完成 30 次已验证建造后退出
 .\.venv\Scripts\python.exe auto_build.py --max-builds 30
 
-# 完成 30 次真实落锤后退出（提前松开不计）
+# 完成 30 次完整左键后退出（按住到落锤点，提前松开不计）
 .\.venv\Scripts\python.exe auto_build.py --max-swings 30
 ```
 
-退出时会打印真实落锤次数、提前松开次数、建造阶段耗时、`ms/件` 和 `ms/锤`。
+退出时会打印完整左键次数、提前松开次数、建造阶段耗时、`ms/件` 和 `ms/次`。完整左键只表示左键按住到了落锤点，不保证游戏一定响应输入。
 
 ## 检测方案
 
@@ -170,12 +183,12 @@ Summary: images=6 yellow=6 white=0 empty=0 failed=0 expect=yellow
 ## Debug 日志
 
 ```powershell
-.\.venv\Scripts\python.exe auto_build.py --debug --max-swings 30 2>&1 |
-  Tee-Object -FilePath logs/debug_run30_old.log
+.\start.bat -DebugMode -MaxSwings 30 -LogFile logs\debug_run30_old.log
 
-.\.venv\Scripts\python.exe auto_build.py --debug --max-swings 30 --chain 2>&1 |
-  Tee-Object -FilePath logs/debug_run30_chain.log
+.\start.bat -DebugMode -MaxSwings 30 -Chain -LogFile logs\debug_run30_chain.log
 ```
+
+自动提权会打开一个新的管理员控制台，原来的 `2>&1 | Tee-Object` 管道无法跨 UAC 继承。需要保存日志时请使用 `--log-file`；如果坚持用 `Tee-Object`，请先在管理员终端中启动，这样不会触发二次提权，管道会保留。
 
 主要标签：
 
@@ -214,13 +227,13 @@ Summary: images=6 yellow=6 white=0 empty=0 failed=0 expect=yellow
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-当前 28 项测试通过。缺少本地 `assets/` 截图时，依赖素材的回归会自动 skip，不会导致测试失败。
+当前 37 项测试通过。缺少本地 `assets/` 截图时，依赖素材的回归会自动 skip，不会导致测试失败。
 
 ## 常见问题
 
 - **截到黑屏**：使用无边框窗口，不要用独占全屏。
-- **鼠标/左键无效**：脚本与游戏保持相同权限级别；先运行 `--test-click 3` 在记事本验证输入。
-- **F8 有时不能暂停**：已使用按下锁存位，暂停会在当前挥锤/检测步骤结束后生效。
+- **鼠标/左键无效、没有锤**：脚本与游戏必须保持相同权限级别。启动时会自动请求管理员权限；如果 UAC 被拒绝，程序会直接退出。日志会打印“进程权限”，应为“管理员”。也可先运行 `--test-click 8` 在记事本验证输入；提权后的控制台会先获得焦点，留出时间切到目标窗口。
+- **准星不动但一直显示建造成功**：之前快速白叉检测可能把裁剪到边界的白色墙面误判为白叉；现在会拒绝这种边界连通域，并用最近的黄叉位置校验点击结果。若仍出现，用 `--debug` 查看 `DET lock/V/S` 和 `VERIFY moved_px`。
 - **黄叉变白后停住**：检查白叉阈值和 `WHITE` 日志，HDR 可能改变亮度/饱和度。
 - **原地挥锤**：检查日志中的 `stale=True` 或 `AIM stale lock -> real target`。
 - **落锤后有空档**：看 `DET detect_ms`、`VERIFY` 和 `WAIT`；快速检测下 ROI 通常低于约 12 ms。

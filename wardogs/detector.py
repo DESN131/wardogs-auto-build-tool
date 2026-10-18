@@ -430,6 +430,11 @@ class MarkerDetector:
         )
         for candidate in candidates:
             bx, by, bw, bh = candidate.bbox
+            if (bx <= 1 or by <= 1
+                    or bx + bw >= crop.shape[1] - 1
+                    or by + bh >= crop.shape[0] - 1):
+                # A clipped wall/scenery component is not a complete X.
+                continue
             submask = mask[by:by + bh, bx:bx + bw]
             if not submask.size or not np.any(submask):
                 continue
@@ -500,8 +505,20 @@ class MarkerDetector:
             aspect_min=wcfg.aspect_min, aspect_max=wcfg.aspect_max,
             center=(lcx, lcy), include_hsv=False,
         )
+        def touches_border(candidate: Candidate) -> bool:
+            x, y, w, h = candidate.bbox
+            # A large wall/background clipped by the 320x320 crop can look
+            # like a white blob; a real white X is fully inside this crop.
+            return (x <= 1 or y <= 1
+                    or x + w >= cw - 1 or y + h >= ch - 1)
+        white = [c for c in white if not touches_border(c)]
         label = int(labels[lcy, lcx])
         comp_ok = self._white_component_ok(stats, label)
+        if label > 0:
+            lx, ly, lw, lh = (int(v) for v in stats[label][:4])
+            if (lx <= 1 or ly <= 1
+                    or lx + lw >= cw - 1 or ly + lh >= ch - 1):
+                comp_ok = False
         bright = patch_white_frac >= 0.45
         if (not comp_ok
                 and center_v >= wcfg.relaxed_v
@@ -515,6 +532,12 @@ class MarkerDetector:
             comp_ok = self._white_component_ok(
                 r_stats, int(r_labels[lcy, lcx])
             )
+            rlabel = int(r_labels[lcy, lcx])
+            if rlabel > 0:
+                lx, ly, lw, lh = (int(v) for v in r_stats[rlabel][:4])
+                if (lx <= 1 or ly <= 1
+                        or lx + lw >= cw - 1 or ly + lh >= ch - 1):
+                    comp_ok = False
             bright = comp_ok
         primary_lock = bool(
             comp_ok and bright and center_s <= wcfg.s_max
@@ -545,6 +568,9 @@ class MarkerDetector:
                 aspect_min=wcfg.aspect_min, aspect_max=wcfg.aspect_max,
                 center=(lcx, lcy), include_hsv=False,
             )
+            white_relaxed = [
+                c for c in white_relaxed if not touches_border(c)
+            ]
             bbox_contains = any(
                 x <= lcx <= x + cw and y <= lcy <= y + ch
                 for x, y, cw, ch in (c.bbox for c in white_relaxed)
