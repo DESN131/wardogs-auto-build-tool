@@ -84,10 +84,10 @@ wardogs-auto-build/
 ├─ docs/方案.md             # 设计与实验记录
 ├─ assets/                  # 本地验证截图（不提交）
 ├─ tests/                   # 单元测试
-├─ logs/                    # 运行日志（不提交）
-├─ artifacts/               # 调试图/标注图（不提交）
 └─ .gitignore
 ```
+
+`logs/` 和 `artifacts/` 不随仓库创建；使用 `--log-file`、`--save-debug` 时按需生成，并已被 `.gitignore` 忽略。
 
 ## 建造模式
 

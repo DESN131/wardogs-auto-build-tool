@@ -20,9 +20,7 @@ config.local.yaml
 
 # Runtime logs and generated artifacts
 logs/*
-!logs/.gitkeep
 artifacts/*
-!artifacts/.gitkeep
 debug/
 _analysis/
 
