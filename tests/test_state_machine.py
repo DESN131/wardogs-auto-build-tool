@@ -225,6 +225,114 @@ class StateMachineTest(unittest.TestCase):
         self.assertIsNotNone(target)
         self.assertEqual(target.center, nxt.center)
 
+    def test_overlapping_next_yellow_is_not_filtered_near_crosshair(self):
+        config = {
+            "aim": {"settle_ms": [0, 0]},
+            "click": {}, "miss": {},
+            "swing": {
+                "enabled": True,
+                "stale_lock_min_px": 55,
+                "stale_lock_hint_px": 180,
+                "stale_lock_max_age_s": 2.0,
+            },
+            "game": {},
+        }
+        bot = BuildBot(
+            config, None, None, FakeMover(), FakeKeys(),
+            hwnd=None, fixed_region=(0, 0, 2560, 1440),
+            dry_run=True, max_builds=0, debug_dir=None,
+        )
+        ghost = marker(1280, 720)
+        overlapping_next = marker(1252, 704)  # only 32 px from the crosshair
+        det = detection_multi([ghost, overlapping_next], locked=True)
+        bot._pending_target = overlapping_next.center
+        bot._pending_target_time = time.monotonic()
+        target = bot._stale_lock_target(det)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.center, overlapping_next.center)
+
+    def test_overlapping_new_x_is_verified_by_small_screen_move(self):
+        config = {
+            "aim": {"settle_ms": [0, 0]},
+            "click": {
+                "hold_ms": 510, "post_release_ms": [0, 0],
+                "build_wait_s": 0.02, "poll_ms": 0,
+                "ensure_cursor_in_window": False,
+            },
+            "miss": {"every_n_builds": 0},
+            "swing": {"enabled": True, "overlap_min_move_px": 1.0},
+            "game": {},
+        }
+        mover = SwingAimMover()
+        bot = BuildBot(
+            config, None, None, mover, FakeKeys(),
+            hwnd=None, fixed_region=(0, 0, 2560, 1440),
+            dry_run=False, max_builds=0, debug_dir=None,
+        )
+        bot._sleep = lambda ms: None
+        old = marker(1280, 720)
+        overlapping_next = marker(1282, 719)
+        bot._last_yellow = old
+        bot._last_yellow_time = time.monotonic()
+        queue = [detection(locked=True), detection(overlapping_next)]
+        bot._detect = lambda **_kwargs: queue.pop(0)
+        bot.mode = "CLICK"
+        bot._step()
+        self.assertEqual(bot.stats.aimed_builds, 1)
+        self.assertEqual(bot.stats.failed_clicks, 0)
+
+    def test_failed_hit_micro_adjusts_instead_of_pausing(self):
+        config = {
+            "aim": {"settle_ms": [0, 0]},
+            "click": {
+                "hold_ms": 510, "post_release_ms": [0, 0],
+                "build_wait_s": 0.01, "poll_ms": 0, "max_failed_clicks": 1,
+                "failed_hit_recovery_delay_ms": [0, 0],
+                "ensure_cursor_in_window": False,
+            },
+            "miss": {"every_n_builds": 0},
+            "swing": {"enabled": False},
+            "game": {},
+        }
+        mover = FakeMover()
+        bot = BuildBot(
+            config, None, None, mover, FakeKeys(),
+            hwnd=None, fixed_region=(0, 0, 2560, 1440),
+            dry_run=False, max_builds=0, debug_dir=None,
+        )
+        bot._sleep = lambda ms: None
+        bot._detect = lambda **_kwargs: detection(locked=True)
+        bot.mode = "CLICK"
+        bot._step()
+        self.assertFalse(bot.hard_pause)
+        self.assertEqual(bot.mode, "CLICK")
+        self.assertEqual(bot.stats.failed_clicks, 1)
+        self.assertEqual(len(mover.moves), 1)
+
+    def test_confirmed_next_target_turning_white_is_clicked(self):
+        config = {
+            "aim": {"settle_ms": [0, 0], "white_frames": 1},
+            "click": {}, "miss": {},
+            "swing": {
+                "enabled": True,
+                "stale_lock_hint_px": 180,
+                "stale_lock_max_age_s": 2.0,
+            },
+            "game": {"allow_cold_white": True},
+        }
+        bot = BuildBot(
+            config, None, None, FakeMover(), FakeKeys(),
+            hwnd=None, fixed_region=(0, 0, 2560, 1440),
+            dry_run=True, max_builds=0, debug_dir=None,
+        )
+        bot._sleep = lambda ms: None
+        bot._pending_target = (1280.0, 720.0)
+        bot._pending_target_time = time.monotonic()
+        bot._detect = lambda **_kwargs: detection(locked=True)
+        bot.mode = "AIM"
+        bot._step()
+        self.assertEqual(bot.mode, "CLICK")
+
     def test_swing_aim_ignores_stale_white_at_crosshair(self):
         config = {
             "aim": {"settle_ms": [0, 0]},
@@ -415,6 +523,37 @@ class StateMachineTest(unittest.TestCase):
         bot._step()   # another chain swing; counts build #2
         self.assertEqual(bot.stats.aimed_builds, 2)
         self.assertEqual(mover.clicks, 3)
+
+    def test_chain_accepts_overlapping_spawn_instead_of_stopping(self):
+        config = {
+            "aim": {"settle_ms": [0, 0]},
+            "click": {"hold_ms": 510, "max_failed_clicks": 1},
+            "miss": {"every_n_builds": 0},
+            "swing": {
+                "enabled": True, "chain": True,
+                "chain_min_move_px": 40, "overlap_min_move_px": 1,
+            },
+            "game": {},
+        }
+        bot = BuildBot(
+            config, None, None, FakeMover(), FakeKeys(),
+            hwnd=None, fixed_region=(0, 0, 2560, 1440),
+            dry_run=True, max_builds=0, debug_dir=None,
+        )
+        old = marker(1280, 720)
+        overlapping = marker(1282, 719)
+        prev = {
+            "expected_old": old.center,
+            "aim_ok": True,
+            "build_start": time.perf_counter(),
+            "pre_target": old.center,
+            "pre_candidate": old,
+            "verify_move": 40.0,
+        }
+        self.assertTrue(bot._chain_judge_previous(overlapping, prev))
+        self.assertEqual(bot.stats.aimed_builds, 1)
+        self.assertEqual(bot.stats.failed_clicks, 0)
+        self.assertFalse(bot._chain_stop_after)
 
     def test_max_swings_counts_only_full_hammers(self):
         config = {

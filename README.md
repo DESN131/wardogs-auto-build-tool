@@ -65,7 +65,8 @@
 - 两级快速检测：大画面降采样找候选，再回全分辨率局部确认。
 - 拟人化鼠标移动：弯曲路径、随机抖动、短延迟和末端过冲修正。
 - 510 ms 起锤，前约 450 ms 继续瞄准，最后 60 ms 停止移动。
-- 白叉锁定、新黄叉验证、陈旧白叉过滤。
+- 白叉锁定、新黄叉验证、陈旧白叉过滤，并支持新旧叉因视角重叠的正常识别。
+- 落锤未生效时围绕目标微调后立即重敲；连续失败只告警，不会因此自动暂停。
 - 支持连续建造、按建造数/完整左键数停止、离线截图验证。
 
 ## 项目结构
@@ -212,8 +213,10 @@ Summary: images=6 yellow=6 white=0 empty=0 failed=0 expect=yellow
 | `detector.roi_half` | 瞄准/轮询 ROI 半径，默认 500 |
 | `click.hold_ms` | 左键保持时间，默认 510 ms |
 | `click.poll_ms` | 新黄叉轮询间隔，默认 10 ms |
+| `click.failed_hit_recovery_max_attempts` | 微调告警阈值，达到后继续重试而不会暂停 |
 | `swing.chain` | 链式挥锤，默认 `false` |
 | `swing.chain_probe_ms` | 链式新叉探测时间，默认 450 ms |
+| `swing.overlap_min_move_px` | 新旧叉屏幕重叠时接受新叉的最小位移，默认 3 px |
 | `aim.gain_x/gain_y` | 屏幕像素/鼠标 counts 增益 |
 | `human.*` | 弯曲、抖动、延迟、过冲参数 |
 | `miss.every_n_builds` | 每 N 次建造插入一次非瞄准点击，0 关闭 |
@@ -227,7 +230,7 @@ Summary: images=6 yellow=6 white=0 empty=0 failed=0 expect=yellow
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-当前 37 项测试通过。缺少本地 `assets/` 截图时，依赖素材的回归会自动 skip，不会导致测试失败。
+当前 42 项测试通过。缺少本地 `assets/` 截图时，依赖素材的回归会自动 skip，不会导致测试失败。
 
 ## 常见问题
 
@@ -235,6 +238,8 @@ Summary: images=6 yellow=6 white=0 empty=0 failed=0 expect=yellow
 - **鼠标/左键无效、没有锤**：脚本与游戏必须保持相同权限级别。启动时会自动请求管理员权限；如果 UAC 被拒绝，程序会直接退出。日志会打印“进程权限”，应为“管理员”。也可先运行 `--test-click 8` 在记事本验证输入；提权后的控制台会先获得焦点，留出时间切到目标窗口。
 - **准星不动但一直显示建造成功**：之前快速白叉检测可能把裁剪到边界的白色墙面误判为白叉；现在会拒绝这种边界连通域，并用最近的黄叉位置校验点击结果。若仍出现，用 `--debug` 查看 `DET lock/V/S` 和 `VERIFY moved_px`。
 - **黄叉变白后停住**：检查白叉阈值和 `WHITE` 日志，HDR 可能改变亮度/饱和度。
+- **白叉已亮但游戏未判定落锤**：日志会出现“落锤未生效，微调瞄准后重敲”，脚本会自动小幅偏移并再次起锤；连续失败不会自动暂停。
+- **新旧黄叉在画面上重叠**：脚本按上次确认的生成位置追踪新叉，不再要求它必须离准星 55 px；需保持 `swing.overlap_min_move_px` 为默认的 3 px。
 - **原地挥锤**：检查日志中的 `stale=True` 或 `AIM stale lock -> real target`。
 - **落锤后有空档**：看 `DET detect_ms`、`VERIFY` 和 `WAIT`；快速检测下 ROI 通常低于约 12 ms。
 - **DPI/画面缩放错位**：确认客户区尺寸与游戏渲染尺寸一致。

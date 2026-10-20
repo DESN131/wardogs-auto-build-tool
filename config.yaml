@@ -86,6 +86,11 @@ click:
   max_failed_clicks: 3
   retry_delay_ms: 250
   min_move_px: 12              # 点击后新黄叉至少移动这么多像素才算成功
+  # 白叉落锤未生效时，不再累计 3 次后暂停；改为绕目标微调后重敲。
+  failed_hit_recovery_max_attempts: 4  # 达到后继续放宽微调，不会自动停止
+  failed_hit_nudge_min_counts: 4
+  failed_hit_nudge_max_counts: 10
+  failed_hit_recovery_delay_ms: [25, 55]
   ensure_cursor_in_window: true   # 点击前若系统光标已跑出客户区，先移回中心
   max_builds: 0               # 0 = 不限；命令行 --max-builds 可覆盖
   max_swings: 0               # 0 = 不限；按完整左键次数限制，便于 30 次对比测试
@@ -112,9 +117,12 @@ swing:
   chain_probe_ms: 450
   # 建造成功后旧白叉会在准星处残留短暂时间，而新黄叉已经出现在旁边。
   # 此时不要把中心白叉当成可建造目标，否则会原地挥锤。
-  stale_lock_min_px: 55        # 距准星超过此距离的黄叉才可能是“下一个目标”
+  stale_lock_min_px: 55        # 抡锤候选少于该距离时的保守过滤阈值
   stale_lock_hint_px: 180      # 与上次确认的新黄叉位置相差不超过此值
   stale_lock_max_age_s: 2.0    # 提示有效期
+  # 视角导致新旧叉在屏幕上重叠时，只要新叉至少移动这么多像素或轮廓变化，
+  # 就按正常的相邻新叉处理，不再要求至少 12/40 px 的明显位移。
+  overlap_min_move_px: 3
 
 human:
   pre_move_ms: [10, 35]

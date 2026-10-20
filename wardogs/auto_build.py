@@ -183,6 +183,9 @@ class BuildBot:
         self.max_builds = max_builds
         self.debug_dir = debug_dir
         self.roi_half = int(cfg_get(config, "detector.roi_half", 500))
+        self.white_click_radius = float(
+            cfg_get(config, "detector.white.click_radius_px", 120.0)
+        )
         self.debug_trace = debug_trace
         if self.debug_dir is not None:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
@@ -225,6 +228,7 @@ class BuildBot:
         self.stale_lock_min_px = float(swing.get("stale_lock_min_px", 55.0))
         self.stale_lock_hint_px = float(swing.get("stale_lock_hint_px", 180.0))
         self.stale_lock_max_age = float(swing.get("stale_lock_max_age_s", 2.0))
+        self.overlap_min_move_px = float(swing.get("overlap_min_move_px", 3.0))
 
         click = config.get("click") or {}
         self.click_hold_ms = float(click.get("hold_ms", 510.0))
@@ -233,6 +237,19 @@ class BuildBot:
         self.poll_ms = float(click.get("poll_ms", 10.0))
         self.max_failed = int(click.get("max_failed_clicks", 3))
         self.retry_delay_ms = float(click.get("retry_delay_ms", 250.0))
+        self.failed_hit_recovery_max = max(
+            1, int(click.get("failed_hit_recovery_max_attempts", 4))
+        )
+        self.failed_hit_nudge_min = float(
+            click.get("failed_hit_nudge_min_counts", 4.0)
+        )
+        self.failed_hit_nudge_max = max(
+            self.failed_hit_nudge_min,
+            float(click.get("failed_hit_nudge_max_counts", 10.0)),
+        )
+        self.failed_hit_recovery_delay_ms = tuple(
+            float(v) for v in click.get("failed_hit_recovery_delay_ms", [25, 55])
+        )
         self.min_build_move = float(click.get("min_move_px", 12.0))
         self.ensure_cursor_in_window = bool(click.get("ensure_cursor_in_window", True))
         self.max_swings = int(click.get("max_swings", 0))
@@ -287,6 +304,8 @@ class BuildBot:
         self._pending_miss = False
         self._build_streak = 0
         self._last_wait_log = 0.0
+        self._failed_hit_recovery_attempts = 0
+        self._failed_hit_recovery_phase = self.random.uniform(0.0, math.tau)
 
     # ------------------------------------------------------------- utilities
     def _trace(self, tag: str, message: str = "", **fields: Any) -> None:
@@ -568,10 +587,19 @@ class BuildBot:
             self._capture_problem()
             return
         if det.locked:
-            if self._stale_lock_target(det) is not None:
+            hinted = self._hinted_candidate(det)
+            if hinted is not None:
                 self._trace("SEARCH", "stale white -> AIM")
                 self._last_det = None
                 self._set_mode("AIM")
+                return
+            if (self._pending_target_active()
+                    and not self._pending_target_at_crosshair(det)):
+                # The new X can be temporarily hidden by the old white X or
+                # the hammer.  Do not treat that old white as a fresh lock.
+                self._white_hits = 0
+                self._trace("SEARCH", "pending target temporarily hidden")
+                self._sleep(20)
                 return
             if self._build_start is None:
                 self._build_start = time.perf_counter()
@@ -631,27 +659,20 @@ class BuildBot:
         self._sleep(40)
         return False
 
-    def _stale_lock_target(self, det: Detection) -> Optional[Candidate]:
-        """Return the real next yellow X while an old white X is still fading.
+    def _hinted_candidate(self, det: Detection) -> Optional[Candidate]:
+        """Return the yellow X matching the last confirmed spawn hint.
 
-        WARDOGS keeps the just-built white X under the crosshair for a short
-        while and already shows the next yellow X nearby.  Treating that
-        leftover white as a lock makes the bot swing in place.  Only accept a
-        far yellow candidate that matches the target confirmed by the last
-        successful build poll, so unrelated yellow scenery is ignored.
+        A new X can overlap the old white X on screen because of perspective.
+        Therefore the distance from the crosshair must not be used as a hard
+        filter here; the spawn hint is the reliable discriminator.
         """
-        if not det.locked or self._pending_target is None:
+        if self._pending_target is None:
             return None
         if time.monotonic() - self._pending_target_time > self.stale_lock_max_age:
             self._pending_target = None
             return None
-        cx, cy = det.screen_center
         nearby: list[tuple[float, Candidate]] = []
         for candidate in det.yellow:
-            centre_dist = math.hypot(candidate.center[0] - cx,
-                                     candidate.center[1] - cy)
-            if centre_dist < self.stale_lock_min_px:
-                continue
             hint_dist = math.hypot(candidate.center[0] - self._pending_target[0],
                                    candidate.center[1] - self._pending_target[1])
             if hint_dist <= self.stale_lock_hint_px:
@@ -659,7 +680,31 @@ class BuildBot:
         if not nearby:
             return None
         nearby.sort(key=lambda item: item[0])
+        self._pending_target_time = time.monotonic()
         return nearby[0][1]
+
+    def _pending_target_active(self) -> bool:
+        return (self._pending_target is not None
+                and time.monotonic() - self._pending_target_time
+                <= self.stale_lock_max_age)
+
+    def _pending_target_at_crosshair(self, det: Detection) -> bool:
+        if not self._pending_target_active():
+            return False
+        cx, cy = det.screen_center
+        return math.hypot(self._pending_target[0] - cx,
+                          self._pending_target[1] - cy) <= self.white_click_radius
+
+    def _stale_lock_target(self, det: Detection) -> Optional[Candidate]:
+        """Return the next yellow X when the old white X still owns the lock.
+
+        Perspective can make the two markers overlap.  A candidate close to the
+        crosshair remains valid when it matches the spawn hint from the last
+        successful build poll.
+        """
+        if not det.locked:
+            return None
+        return self._hinted_candidate(det)
 
     def _aim_step(self) -> None:
         # Reuse the yellow detection that just promoted SEARCH -> AIM, or the
@@ -677,9 +722,17 @@ class BuildBot:
         if det is None:
             self._capture_problem()
             return
+        stale_target_active = False
+        tracking_pending = False
         if det.locked:
             stale = self._stale_lock_target(det)
             if stale is None:
+                if (self._pending_target_active()
+                        and not self._pending_target_at_crosshair(det)):
+                    self._white_hits = 0
+                    self._trace("AIM", "pending target temporarily hidden")
+                    self._sleep(20)
+                    return
                 self._pending_target = None
                 if self._build_start is None:
                     self._build_start = time.perf_counter()
@@ -689,10 +742,18 @@ class BuildBot:
             # The crosshair is still on the previous build's fading white X.
             # Aim at the next yellow X instead of confirming the stale lock.
             det.best = stale
+            stale_target_active = True
+            tracking_pending = True
             self._trace("AIM", "stale lock -> real target",
                         bbox=stale.bbox,
                         target=(round(stale.center[0]), round(stale.center[1])),
                         hint=self._pending_target)
+        elif det.best is not None:
+            hinted = self._hinted_candidate(det)
+            tracking_pending = bool(
+                hinted is not None
+                and math.dist(hinted.center, det.best.center) <= 2.0
+            )
         self._white_hits = 0
         if det.best is None:
             if self._recover_white(det):
@@ -729,7 +790,12 @@ class BuildBot:
             return
 
         self._iterations += 1
-        if self._iterations > self.max_iterations:
+        # Aiming away from an overlapping old white X can legitimately take a
+        # few extra corrections.  Do not let that normal overlap trip the
+        # generic aim-iteration safety pause.
+        if stale_target_active:
+            self._iterations = 0
+        elif self._iterations > self.max_iterations:
             self._hard_pause("瞄准迭代超过 %d 次" % self.max_iterations)
             return
 
@@ -771,6 +837,11 @@ class BuildBot:
         move_start = time.perf_counter()
         if not self.mover.move(int(round(mx)), int(round(my)), abort=self._abort):
             raise Aborted
+        if tracking_pending and self._pending_target is not None:
+            self._pending_target = (
+                self._pending_target[0] + mx * self.gain_x,
+                self._pending_target[1] + my * self.gain_y,
+            )
         move_ms = (time.perf_counter() - move_start) * 1000.0
         settle_start = time.perf_counter()
         self._sleep(self.random.uniform(*self.settle_ms))
@@ -790,9 +861,24 @@ class BuildBot:
                     after=("lock" if after_det and after_det.locked else
                            ("yellow" if after_det and after_det.best else "lost")))
         if after_det is not None and after_det.locked:
-            self._trace("AIM", "post-move lock -> CLICK")
-            if self._white_confirm(after_det):
-                return
+            after_stale = self._stale_lock_target(after_det)
+            if after_stale is not None:
+                self._trace("AIM", "post-move stale lock -> real target",
+                            bbox=after_stale.bbox)
+                after_det.best = after_stale
+                self._pending_target = after_stale.center
+            elif (self._pending_target_active()
+                  and not self._pending_target_at_crosshair(after_det)):
+                self._white_hits = 0
+                self._trace("AIM", "post-move waiting for hinted target")
+            else:
+                self._trace("AIM", "post-move lock -> CLICK")
+                if self._white_confirm(after_det):
+                    return
+        if after_det is not None and not after_det.locked:
+            after_hint = self._hinted_candidate(after_det)
+            if after_hint is not None:
+                self._pending_target = after_hint.center
         if after_det is not None and after_det.best is not None and not after_det.locked:
             self._update_gain((mx, my), before, after_det.best.center,
                               after_det.screen_center)
@@ -952,6 +1038,69 @@ class BuildBot:
         self._calibrated = True
         return False
 
+    @staticmethod
+    def _candidate_shape_changed(before: Optional[Candidate],
+                                 after: Candidate) -> bool:
+        """Detect a distinct overlapping X when centre displacement is tiny."""
+        if before is None:
+            return False
+        area_delta = abs(after.area - before.area)
+        width_delta = abs(after.bbox[2] - before.bbox[2])
+        height_delta = abs(after.bbox[3] - before.bbox[3])
+        return (area_delta >= max(40, before.area * 0.06)
+                or width_delta >= max(3, before.bbox[2] * 0.06)
+                or height_delta >= max(3, before.bbox[3] * 0.06))
+
+    def _recover_failed_hit(self, pre_target: tuple[float, float],
+                            last_locked: bool) -> None:
+        """Micro-adjust and retry instead of pausing on a non-registering hit.
+
+        WARDOGS can keep the white preview visible even when the server does
+        not accept a hammer hit.  A tiny camera correction changes the contact
+        point; the next loop then attacks again.  Attempts rotate around the
+        target and widen gradually, but never pause automatically.
+        """
+        self._failed_hit_recovery_attempts += 1
+        attempt = self._failed_hit_recovery_attempts
+        widen = 1.0 + 0.35 * ((attempt - 1) // self.failed_hit_recovery_max)
+        radius = self.random.uniform(self.failed_hit_nudge_min,
+                                     self.failed_hit_nudge_max) * min(widen, 2.0)
+        angle = self._failed_hit_recovery_phase + attempt * 2.399963229728653
+        mx = int(round(math.cos(angle) * radius))
+        my = int(round(math.sin(angle) * radius))
+        if mx == 0 and my == 0:
+            mx = max(1, int(round(radius)))
+        log.warning(
+            "落锤未生效，微调瞄准后重敲（第 %d 次，目标约 (%d,%d)，"
+            "偏移 %+d,%+d counts，白叉=%s）",
+            attempt, round(pre_target[0]), round(pre_target[1]),
+            mx, my, "是" if last_locked else "否",
+        )
+        if self._failed_hit_recovery_attempts == self.failed_hit_recovery_max:
+            log.warning("连续失败达到建议阈值 %d，继续自动微调；按 F9 停止",
+                        self.failed_hit_recovery_max)
+        if not self.mover.move(mx, my, abort=self._abort):
+            raise Aborted
+        self._sleep(self.random.uniform(*self.failed_hit_recovery_delay_ms))
+        self._last_det = None
+        self._last_det_time = 0.0
+        self._click_target = None
+        self._pending_target = None
+        det = self._detect()
+        if det is None:
+            self._capture_problem()
+            self._set_mode("SEARCH")
+            return
+        if det.locked:
+            # Re-enter CLICK immediately so the next 510 ms hold starts from
+            # the new camera contact point, rather than losing the adjustment.
+            self._set_mode("CLICK")
+            return
+        if det.best is not None:
+            self._set_mode("AIM")
+            return
+        self._set_mode("SEARCH")
+
     # ------------------------------------------------------------- clicking
     def _click_step(self) -> None:
         # The white lock was established in the previous state; reuse that
@@ -1025,6 +1174,14 @@ class BuildBot:
             pre_target = self._last_yellow.center
         else:
             pre_target = det.screen_center
+        aim_candidate = preferred
+        if aim_candidate is None:
+            aim_candidate = det.best
+        if (aim_candidate is None and self._last_yellow is not None
+                and self._last_yellow_time is not None
+                and time.monotonic() - self._last_yellow_time <= 1.5):
+            aim_candidate = self._last_yellow
+        trusted_start_lock = bool(det.locked and stale is None)
         log.info("起锤 %.0f ms，期间继续瞄准（落锤前 %.0f ms 停手）",
                  self.click_hold_ms, self.swing_strike_guard)
         click_start = time.perf_counter()
@@ -1079,6 +1236,7 @@ class BuildBot:
                                 if self._build_start is not None
                                 else click_start),
                 "pre_target": pre_target,
+                "pre_candidate": aim_candidate,
                 "verify_move": verify_move,
             }
             self._pending_target = None
@@ -1120,12 +1278,26 @@ class BuildBot:
                         ms=round((time.perf_counter() - poll_start) * 1000.0, 1),
                         yellow=(probe.best is not None),
                         lock=probe.locked)
-            if probe.best is not None and not probe.locked:
+            if probe.best is not None:
                 moved = math.hypot(probe.best.center[0] - start_center[0],
                                    probe.best.center[1] - start_center[1])
+                shape_changed = self._candidate_shape_changed(aim_candidate,
+                                                               probe.best)
+                aimed_hit = trusted_start_lock or aim_state["ok"]
+                overlap_ok = bool(
+                    aimed_hit
+                    and (moved >= self.overlap_min_move_px
+                         or shape_changed)
+                )
                 self._trace("VERIFY", "candidate", moved_px=round(moved, 1),
-                            need_px=round(verify_move, 1))
-                if moved >= verify_move:
+                            need_px=round(verify_move, 1),
+                            overlap_ok=overlap_ok,
+                            shape_changed=shape_changed)
+                if moved >= verify_move or overlap_ok:
+                    if moved < verify_move:
+                        self._trace("VERIFY", "overlapping new X accepted",
+                                    moved_px=round(moved, 1),
+                                    locked=probe.locked)
                     new_det = probe
                     break
             last_locked = probe.locked
@@ -1146,12 +1318,8 @@ class BuildBot:
         else:
             log.warning("点击后 %.1f s 内没有找到新的黄叉，失败 %d/%d",
                         self.build_wait, self.stats.failed_clicks, self.max_failed)
-        if self.stats.failed_clicks >= self.max_failed:
-            self._hard_pause("连续建造失败，可能物资不足或预览无效")
-        else:
-            self._white_hits = 0
-            self._set_mode("AIM")
-            self._sleep(self.retry_delay_ms)
+        self._white_hits = 0
+        self._recover_failed_hit(pre_target, last_locked)
 
     # ------------------------------------------------------- chained swings
     def _count_swing(self, hold_ms: float) -> bool:
@@ -1169,23 +1337,34 @@ class BuildBot:
             return True
         return False
 
-    def _chain_target_from(self, det: Detection) -> Optional[Candidate]:
+    def _chain_target_from(self, det: Detection,
+                           prev: Optional[dict[str, Any]] = None
+                           ) -> Optional[Candidate]:
         """Pick the new yellow X, ignoring the old white/ghost at the crosshair."""
         if not det.yellow:
             return None
+        if prev is not None:
+            previous = prev.get("pre_target")
+            if previous is not None:
+                nearby = [
+                    c for c in det.yellow
+                    if math.hypot(c.center[0] - previous[0],
+                                  c.center[1] - previous[1])
+                    <= self.stale_lock_hint_px
+                ]
+                if nearby:
+                    nearby.sort(key=lambda c: math.hypot(
+                        c.center[0] - previous[0], c.center[1] - previous[1]
+                    ))
+                    return nearby[0]
         cx, cy = det.screen_center
-        # The newly spawned X can be close to the old one but never identical.
-        # Ignore only the very small centre ghost/fringe.
-        limit = max(30.0, self.stale_lock_min_px * 0.6)
-        far = [
-            c for c in det.yellow
-            if math.hypot(c.center[0] - cx, c.center[1] - cy) >= limit
-        ]
-        if not far:
-            return None
-        far.sort(key=lambda c: math.hypot(c.center[0] - cx,
-                                          c.center[1] - cy))
-        return far[0]
+        # Do not reject a marker merely because perspective projects it close
+        # to the crosshair.  The detector already removes the small build UI.
+        det.yellow = sorted(
+            det.yellow,
+            key=lambda c: math.hypot(c.center[0] - cx, c.center[1] - cy),
+        )
+        return det.yellow[0]
 
     def _chain_judge_previous(self, target: Candidate,
                               prev: dict[str, Any]) -> bool:
@@ -1193,25 +1372,37 @@ class BuildBot:
         moved = math.hypot(target.center[0] - expected[0],
                            target.center[1] - expected[1])
         need = max(self.chain_min_move, float(prev.get("verify_move", 0.0)))
+        shape_changed = self._candidate_shape_changed(
+            prev.get("pre_candidate"), target
+        )
         self._trace("CHAIN", "new target", moved_px=round(moved, 1),
-                    need_px=round(need, 1), prev_aim=prev["aim_ok"])
+                    need_px=round(need, 1), prev_aim=prev["aim_ok"],
+                    shape_changed=shape_changed)
         if moved < need:
-            if prev["aim_ok"] and moved < 8.0:
+            overlap_ok = bool(
+                prev["aim_ok"]
+                and (moved >= self.overlap_min_move_px or shape_changed)
+            )
+            if not overlap_ok and prev["aim_ok"] and moved < 8.0:
                 self.stats.failed_clicks += 1
                 self._trace("CHAIN", "previous X did not move",
                             failed=self.stats.failed_clicks)
                 if self.stats.failed_clicks >= self.max_failed:
-                    self._chain_stop_after = True
-                    self._chain_pause_reason = "链式挥锤连续未推动建造"
-            elif prev["aim_ok"]:
+                    log.warning("链式挥锤连续未确认建造 %d 次，继续微调；按 F9 停止",
+                                self.stats.failed_clicks)
+            elif not overlap_ok and prev["aim_ok"]:
                 # A small but non-zero shift may be a close next X; do not
                 # count it as a success or a failure, just keep aiming.
                 self._trace("CHAIN", "ambiguous move",
                             moved_px=round(moved, 1))
-            else:
+            elif not overlap_ok:
                 self._trace("CHAIN", "partial hit (X stayed)",
                             moved_px=round(moved, 1))
-            return False
+            if not overlap_ok:
+                return False
+            self._trace("CHAIN", "overlapping new X accepted",
+                        moved_px=round(moved, 1),
+                        shape_changed=shape_changed)
         # The old X is knocked away only when the build completes.  A late
         # aim_ok=False correction can still land before the strike, so the
         # position change is the authoritative success signal.
@@ -1220,6 +1411,7 @@ class BuildBot:
                         moved_px=round(moved, 1))
         self.stats.aimed_builds += 1
         self.stats.failed_clicks = 0
+        self._failed_hit_recovery_attempts = 0
         self._build_streak += 1
         self._aim_since_miss += 1
         total_ms = (time.perf_counter() - prev["build_start"]) * 1000.0
@@ -1246,7 +1438,7 @@ class BuildBot:
                 raise Aborted
             det = self._detect(allow_fallback=False)
             if det is not None:
-                target = self._chain_target_from(det)
+                target = self._chain_target_from(det, prev)
                 if target is not None:
                     state["target"] = target
                     state["start_det"] = det
@@ -1337,10 +1529,7 @@ class BuildBot:
                         ("（落锤前松开，0 进度）" if pre_strike_abort
                          else "（已落锤但未瞄准，约 1/5 进度）"),
                         self.stats.failed_clicks, self.max_failed)
-            if self.stats.failed_clicks >= self.max_failed:
-                self._hard_pause("链式挥锤连续找不到黄叉")
-            else:
-                self._set_mode("AIM")
+            self._recover_failed_hit(prev["pre_target"], prev["aim_ok"])
             return
 
         pre_target = target.center
@@ -1355,6 +1544,7 @@ class BuildBot:
             "aim_ok": state["aim_ok"],
             "build_start": swing_start,
             "pre_target": pre_target,
+            "pre_candidate": target,
             "verify_move": verify_move,
         }
         self._trace("CHAIN", "next swing", target=(
@@ -1487,6 +1677,7 @@ class BuildBot:
         self.stats.aimed_builds += 1
         self._build_streak += 1
         self.stats.failed_clicks = 0
+        self._failed_hit_recovery_attempts = 0
         self._aim_since_miss += 1
         self._set_mode("SEARCH")
         self._white_hits = 0
